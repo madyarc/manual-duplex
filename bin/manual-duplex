@@ -9,7 +9,7 @@
 set -euo pipefail
 shopt -s nullglob
 
-VERSION=0.2.0
+VERSION=0.2.1
 QUEUE=Manual_Duplex
 PROG=${0##*/}
 
@@ -212,7 +212,10 @@ duplex_print() {
     fi
     rot=$ROTATE_BACKS
     [[ $edge == short ]] && rot=$(((rot + 180) % 360))
-    ((rot)) && rotate=(--rotate=+$rot)
+    # --flatten-rotation turns the page content itself instead of setting
+    # /Rotate, which some print paths ignore (seen with an HP Smart Tank via
+    # IPP Everywhere).
+    ((rot)) && rotate=(--rotate=+$rot --flatten-rotation)
     qpdf --empty "${rotate[@]}" --pages "${parts[@]}" -- "$tmp/backs.pdf" ||
         die "qpdf could not extract the backs of '$title'"
 
