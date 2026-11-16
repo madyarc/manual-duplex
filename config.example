@@ -1,0 +1,21 @@
+# ~/.config/manual-duplex/config — sourced by manual-duplex (bash syntax).
+# Prefer `manual-duplex config KEY VALUE`, which validates the value.
+
+# Real printer queue (see `lpstat -e`). Empty = CUPS default destination.
+PRINTER=""
+
+# Print the backs last-to-first. Decide with `manual-duplex test`:
+# if the back of sheet 1 shows page 4, toggle this.
+REVERSE_BACKS=no
+
+# Rotate the backs by 180 degrees if they come out upside down.
+ROTATE_BACKS=0
+
+# Extra options for both jobs, e.g. "-o media=A4 -o InputSlot=Manual".
+LP_OPTIONS=""
+
+# Keep processed PDFs in ~/.cache/manual-duplex/done instead of deleting them.
+KEEP_PDFS=no
+
+# Desktop notifications with a "Print backs" button (needs libnotify).
+NOTIFY=yes

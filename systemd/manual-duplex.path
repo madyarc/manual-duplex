@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch the Manual_Duplex spool folder for new print jobs
+Documentation=https://github.com/madyarc/manual-duplex
+
+[Path]
+# Must match "Out" in /etc/cups/cups-pdf-Manual_Duplex.conf
+DirectoryNotEmpty=%h/.cache/manual-duplex/spool
+MakeDirectory=yes
+DirectoryMode=0700
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,16 @@
+post_install() {
+  cat <<'MSG'
+==> manual-duplex: finish the setup in three steps
+    1. sudo manual-duplex setup-printer        # creates the "Manual_Duplex" CUPS queue
+    2. manual-duplex enable                    # as your user: watch the spool folder
+    3. manual-duplex config PRINTER <queue>    # your real printer (see: lpstat -e)
+    Then calibrate once with:  manual-duplex test
+MSG
+}
+
+pre_remove() {
+  if lpstat -e 2>/dev/null | grep -qx Manual_Duplex; then
+    echo "==> The Manual_Duplex CUPS queue still exists; remove it with: sudo lpadmin -x Manual_Duplex"
+  fi
+  echo "==> Each user should run: systemctl --user disable --now manual-duplex.path"
+}

@@ -1,0 +1,464 @@
+#!/usr/bin/env bash
+# manual-duplex — two-sided printing on printers without a duplexer.
+#
+# A cups-pdf virtual printer ("Manual_Duplex") saves each finished job as a
+# PDF in a spool folder. This script splits that PDF into fronts and backs,
+# prints the fronts on the real printer and queues the backs as a held job.
+# The user flips the stack and releases the held job.
+
+set -euo pipefail
+shopt -s nullglob
+
+VERSION=0.1.0
+QUEUE=Manual_Duplex
+PROG=${0##*/}
+
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/manual-duplex
+CONFIG_FILE=$CONFIG_DIR/config
+# Must match the "Out" line in /etc/cups/cups-pdf-Manual_Duplex.conf and the
+# path in manual-duplex.path. cups-pdf only knows ${HOME}, so no XDG vars here.
+STATE_DIR=$HOME/.cache/manual-duplex
+SPOOL_DIR=$STATE_DIR/spool
+DONE_DIR=$STATE_DIR/done
+FAILED_DIR=$STATE_DIR/failed
+HELD_FILE=$STATE_DIR/held-jobs
+LOCK_FILE=$STATE_DIR/lock
+
+# ---------------------------------------------------------------- defaults --
+PRINTER=""          # real printer; empty = CUPS default destination
+REVERSE_BACKS=no    # print backs last-to-first (decide with `manual-duplex test`)
+ROTATE_BACKS=0      # rotate backs by 0 or 180 degrees
+LP_OPTIONS=""       # extra options for both jobs, e.g. "-o media=A4"
+KEEP_PDFS=no        # keep processed PDFs in ~/.cache/manual-duplex/done
+NOTIFY=yes          # desktop notifications (needs notify-send)
+
+CONFIG_KEYS=(PRINTER REVERSE_BACKS ROTATE_BACKS LP_OPTIONS KEEP_PDFS NOTIFY)
+
+# shellcheck source=/dev/null
+[[ -r $CONFIG_FILE ]] && . "$CONFIG_FILE"
+
+# ----------------------------------------------------------------- helpers --
+TMP_DIRS=()
+make_tmp() { # make_tmp VAR — create a temp dir removed when the (sub)shell exits
+    local d
+    d=$(mktemp -d "${TMPDIR:-/tmp}/manual-duplex.XXXXXX") || die "mktemp failed"
+    TMP_DIRS+=("$d")
+    trap 'rm -rf "${TMP_DIRS[@]}"' EXIT
+    printf -v "$1" '%s' "$d"
+}
+log()  { printf '%s: %s\n' "$PROG" "$*" >&2; }
+die()  { log "error: $*"; notify critical "Manual duplex failed" "$*"; exit 1; }
+is_yes() { [[ ${1,,} =~ ^(1|y|yes|true|on)$ ]]; }
+
+notify() { # urgency summary body
+    is_yes "$NOTIFY" && command -v notify-send >/dev/null || return 0
+    notify-send -a "Manual Duplex" -i printer -u "$1" "$2" "${3:-}" 2>/dev/null || true
+}
+
+need() {
+    local c
+    for c in "$@"; do
+        command -v "$c" >/dev/null || die "'$c' not found (install the package that provides it)"
+    done
+}
+
+usage() {
+    cat <<EOF
+$PROG $VERSION — manual two-sided printing for CUPS
+
+Usage:
+  $PROG print FILE.pdf        split FILE.pdf and print it (no virtual printer needed)
+  $PROG test                  print a 2-sheet test page to calibrate the settings
+  $PROG release [JOB-ID]      print the held backs (latest job if no ID given)
+  $PROG status                show settings, printers and held jobs
+  $PROG config [KEY [VALUE]]  show or change a setting
+  $PROG enable | disable      start/stop watching the Manual_Duplex spool folder
+  $PROG process [FILE...]     process spooled PDFs (run by manual-duplex.service)
+
+  sudo $PROG setup-printer    create the "$QUEUE" CUPS queue
+  sudo $PROG remove-printer   delete it again
+
+Settings ($CONFIG_FILE):
+  PRINTER        real printer queue (default: CUPS default destination)
+  REVERSE_BACKS  yes|no  print backs last-to-first      (now: $REVERSE_BACKS)
+  ROTATE_BACKS   0|180   rotate the back pages           (now: $ROTATE_BACKS)
+  LP_OPTIONS     extra lp options, e.g. "-o media=A4"    (now: ${LP_OPTIONS:-none})
+  KEEP_PDFS      yes|no  keep processed PDFs             (now: $KEEP_PDFS)
+  NOTIFY         yes|no  desktop notifications           (now: $NOTIFY)
+EOF
+}
+
+# Resolve the real printer, refusing the virtual queue itself.
+target_printer() {
+    local p=$PRINTER
+    if [[ -z $p ]]; then
+        p=$(LC_ALL=C lpstat -d 2>/dev/null | sed -n 's/^system default destination: //p')
+    fi
+    [[ -n $p ]] || die "no printer set. Run: $PROG config PRINTER <queue>   (queues: $(printer_list))"
+    [[ $p != "$QUEUE" ]] || die "$QUEUE is the virtual printer. Run: $PROG config PRINTER <real queue>"
+    printf '%s\n' "$p"
+}
+
+printer_list() {
+    LC_ALL=C lpstat -e 2>/dev/null | grep -vx "$QUEUE" | paste -sd ' ' || true
+}
+
+# ------------------------------------------------------------ PDF writing --
+# Write a minimal PDF: write_pdf OUT WIDTH HEIGHT CONTENT-STREAM...
+# One page per content stream; font /F1 is Helvetica-Bold.
+write_pdf() {
+    local LC_ALL=C
+    local out=$1 w=$2 h=$3; shift 3
+    local -a objs=() offsets=()
+    local kids="" c body xref entry i=0 n=$#
+
+    for ((i = 0; i < n; i++)); do kids+="$((4 + 2 * i)) 0 R "; done
+    objs+=("<< /Type /Catalog /Pages 2 0 R >>")
+    objs+=("<< /Type /Pages /Kids [ ${kids}] /Count $n >>")
+    objs+=("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>")
+    i=0
+    for c in "$@"; do
+        objs+=("<< /Type /Page /Parent 2 0 R /MediaBox [ 0 0 $w $h ] /Resources << /Font << /F1 3 0 R >> >> /Contents $((5 + 2 * i)) 0 R >>")
+        objs+=("<< /Length ${#c} >>"$'\nstream\n'"$c"$'\nendstream')
+        ((++i))
+    done
+
+    body=$'%PDF-1.4\n'
+    for ((i = 0; i < ${#objs[@]}; i++)); do
+        offsets+=("${#body}")
+        body+="$((i + 1)) 0 obj"$'\n'"${objs[i]}"$'\nendobj\n'
+    done
+    xref=${#body}
+    body+="xref"$'\n'"0 $((${#objs[@]} + 1))"$'\n'"0000000000 65535 f "$'\n'
+    for i in "${offsets[@]}"; do
+        printf -v entry '%010d 00000 n \n' "$i"
+        body+=$entry
+    done
+    body+="trailer"$'\n'"<< /Size $((${#objs[@]} + 1)) /Root 1 0 R >>"$'\n'"startxref"$'\n'"$xref"$'\n%%EOF\n'
+    printf '%s' "$body" >"$out"
+}
+
+# Blank page with the same size as page N of a PDF: blank_like SRC N OUT
+blank_like() {
+    local size w h
+    size=$(LC_ALL=C pdfinfo -f "$2" -l "$2" "$1" 2>/dev/null | awk '/^Page +[0-9]+ size:/ {print $4, $6; exit}')
+    read -r w h <<<"${size:-595 842}"
+    write_pdf "$3" "$w" "$h" ""
+}
+
+# ----------------------------------------------------------- the real work --
+# duplex_print PDF TITLE — print fronts now, queue backs as a held job.
+duplex_print() {
+    local pdf=$1 title=$2 printer pages tmp i
+    local -a fronts=() backs=() lpopts=() rotate=()
+    need qpdf lp pdfinfo
+    printer=$(target_printer)
+
+    pages=$(qpdf --show-npages "$pdf" 2>/dev/null) || die "cannot read '$pdf' as PDF"
+    [[ $pages =~ ^[0-9]+$ ]] && ((pages > 0)) || die "'$pdf' has no pages"
+
+    read -ra lpopts <<<"$LP_OPTIONS"
+    # Layout (n-up etc.) is already baked into the PDF; make the printer leave it alone.
+    lpopts=(-o sides=one-sided -o number-up=1 "${lpopts[@]}")
+
+    make_tmp tmp
+
+    for ((i = 1; i <= pages; i += 2)); do fronts+=("$i"); done
+    for ((i = 2; i <= pages; i += 2)); do backs+=("$i"); done
+
+    qpdf --empty --pages "$pdf" "$(IFS=,; echo "${fronts[*]}")" -- "$tmp/fronts.pdf" ||
+        die "qpdf could not extract the fronts of '$title'"
+
+    if ((pages == 1)); then
+        lp -d "$printer" -t "$title" "${lpopts[@]}" "$tmp/fronts.pdf" >/dev/null ||
+            die "could not send '$title' to $printer"
+        log "'$title': 1 page, sent to $printer (nothing to duplex)"
+        notify normal "Printing “$title”" "Single page — no backs needed."
+        return 0
+    fi
+
+    # Odd page count: the last sheet gets a blank back so every sheet is fed
+    # through again and reversed stacks stay aligned.
+    local -a parts=("$pdf" "$(IFS=,; echo "${backs[*]}")")
+    if ((pages % 2)); then
+        blank_like "$pdf" "$pages" "$tmp/blank.pdf" || die "could not create a blank page"
+        parts+=("$tmp/blank.pdf" 1)
+    fi
+    if is_yes "$REVERSE_BACKS"; then
+        local -a rev=()
+        for ((i = ${#backs[@]} - 1; i >= 0; i--)); do rev+=("${backs[i]}"); done
+        parts=("$pdf" "$(IFS=,; echo "${rev[*]}")")
+        ((pages % 2)) && parts=("$tmp/blank.pdf" 1 "${parts[@]}")
+    fi
+    case $ROTATE_BACKS in
+        0 | "") ;;
+        180) rotate=(--rotate=+180) ;;
+        *) die "ROTATE_BACKS must be 0 or 180 (is '$ROTATE_BACKS')" ;;
+    esac
+    qpdf --empty "${rotate[@]}" --pages "${parts[@]}" -- "$tmp/backs.pdf" ||
+        die "qpdf could not extract the backs of '$title'"
+
+    lp -d "$printer" -t "$title (fronts)" "${lpopts[@]}" "$tmp/fronts.pdf" >/dev/null ||
+        die "could not send fronts of '$title' to $printer"
+
+    local out job
+    out=$(LC_ALL=C lp -d "$printer" -H hold -t "$title (backs)" "${lpopts[@]}" "$tmp/backs.pdf") ||
+        die "could not queue backs of '$title' on $printer"
+    job=$(sed -n 's/^request id is \([^ ]*\).*/\1/p' <<<"$out")
+    [[ -n $job ]] && printf '%s\t%s\n' "$job" "$title" >>"$HELD_FILE"
+
+    local sheets=$(((pages + 1) / 2))
+    log "'$title': $pages pages, fronts sent to $printer, backs held as ${job:-?}"
+    notify_backs "$job" "$title" "$sheets"
+}
+
+# Notification with a "Print backs" button. The button needs a process that
+# waits for the click, so it runs as a transient unit that outlives the
+# oneshot service; without systemd-run it degrades to a plain notification.
+notify_backs() { # job title sheets
+    local msg="When the $3 front sheet(s) are done, flip the stack, put it back in the tray, then release job $1 (or run: $PROG release)."
+    is_yes "$NOTIFY" && command -v notify-send >/dev/null || { log "$msg"; return 0; }
+    if [[ -n $1 ]] && command -v systemd-run >/dev/null &&
+        systemd-run --user --quiet --collect -- "$(realpath "$0")" _await-release "$1" "$2" "$msg" 2>/dev/null; then
+        return 0
+    fi
+    notify normal "Fronts of “$2” printing" "$msg"
+}
+
+await_release() { # job title msg
+    local action
+    action=$(notify-send -a "Manual Duplex" -i printer -u critical -t 0 \
+        -A release="Print backs" -A cancel="Cancel backs" --wait \
+        "Fronts of “$2” printing" "$3" 2>/dev/null) || true
+    case $action in
+        release) release_job "$1" ;;
+        cancel) cancel "$1" 2>/dev/null && forget_job "$1" && notify low "Backs cancelled" "$2" ;;
+    esac
+}
+
+forget_job() {
+    [[ -f $HELD_FILE ]] || return 0
+    local tmp
+    tmp=$(mktemp "$STATE_DIR/.held.XXXXXX")
+    awk -F'\t' -v j="$1" '$1 != j' "$HELD_FILE" >"$tmp" && mv -f "$tmp" "$HELD_FILE"
+}
+
+release_job() {
+    local job=${1:-}
+    if [[ -z $job ]]; then
+        [[ -s $HELD_FILE ]] && job=$(tail -n1 "$HELD_FILE" | cut -f1)
+        [[ -n $job ]] || die "no held backs job recorded (see: lpstat -o)"
+    fi
+    lp -i "$job" -H resume || die "could not release job $job (already printed or cancelled? see: lpstat -o)"
+    forget_job "$job"
+    log "released $job"
+    notify low "Printing backs" "Job $job released."
+}
+
+# Wait until cups-pdf has finished writing FILE: size stable and parseable.
+wait_complete() {
+    # Give up after 120 s in total, or after 10 s without growth that still
+    # does not parse (a broken file rather than one being written).
+    local f=$1 last=-1 size tries=0 stable=0 rc
+    while ((tries++ < 120 && stable < 10)); do
+        [[ -e $f ]] || return 1
+        size=$(stat -c %s -- "$f" 2>/dev/null || echo -1)
+        if [[ $size == "$last" ]] && ((size > 0)) && [[ -r $f ]]; then
+            ((++stable))
+            rc=0
+            qpdf --check "$f" >/dev/null 2>&1 || rc=$?
+            case $rc in 0 | 3) return 0 ;; esac   # 3 = warnings only
+        else
+            stable=0
+        fi
+        last=$size
+        sleep 1
+    done
+    return 1
+}
+
+process_spool() {
+    need qpdf flock
+    mkdir -p "$SPOOL_DIR" "$FAILED_DIR"
+    exec 9>"$LOCK_FILE"
+    flock 9
+
+    local -a files=("$@")
+    if ((${#files[@]} == 0)); then
+        # oldest first; cups-pdf names them job_<id>-<title>.pdf
+        mapfile -t files < <(find "$SPOOL_DIR" -maxdepth 1 -type f -iname '*.pdf' -printf '%T@\t%p\n' | sort -n | cut -f2-)
+    fi
+
+    local f title
+    for f in "${files[@]}"; do
+        title=${f##*/}
+        title=${title%.[pP][dD][fF]}
+        title=${title#job_[0-9]*-}
+        if ! wait_complete "$f"; then
+            log "'$f' never became a complete PDF; moved to $FAILED_DIR"
+            notify critical "Manual duplex failed" "Incomplete PDF: ${f##*/}"
+            mv -f -- "$f" "$FAILED_DIR/" || rm -f -- "$f"
+            continue
+        fi
+        # duplex_print exits on fatal errors; run it in a subshell so one bad
+        # job never leaves its file behind (that would re-trigger the path unit).
+        if (duplex_print "$f" "$title"); then
+            if is_yes "$KEEP_PDFS"; then
+                mkdir -p "$DONE_DIR" && mv -f -- "$f" "$DONE_DIR/"
+            else
+                rm -f -- "$f"
+            fi
+        else
+            mv -f -- "$f" "$FAILED_DIR/" || rm -f -- "$f"
+        fi
+    done
+}
+
+# --------------------------------------------------------------- test page --
+test_print() {
+    local w=595 h=842 paper p sheet side c cx tmp=""
+    paper=$(LC_ALL=C lpoptions -p "$(target_printer)" -l 2>/dev/null |
+        sed -n 's/^PageSize[^:]*:.*\*\([^ ]*\).*/\1/p')
+    [[ ${paper,,} == letter* ]] && { w=612; h=792; }
+    cx=$((w / 2))
+
+    local -a pages=()
+    for p in 1 2 3 4; do
+        sheet=$(((p + 1) / 2))
+        if ((p % 2)); then side=FRONT; else side=BACK; fi
+        c="0 g $((cx - 40)) $((h - 90)) m $cx $((h - 30)) l $((cx + 40)) $((h - 90)) l f"
+        c+=" BT /F1 14 Tf $((cx - 30)) $((h - 110)) Td (TOP EDGE) Tj ET"
+        c+=" BT /F1 320 Tf $((cx - 89)) $((h / 2 - 60)) Td ($p) Tj ET"
+        c+=" BT /F1 26 Tf 60 $((h / 2 - 140)) Td (Sheet $sheet - $side - page $p of 4) Tj ET"
+        c+=" BT /F1 11 Tf 60 140 Td 15 TL"
+        c+=" (Expected: sheet 1 = pages 1 and 2, sheet 2 = pages 3 and 4,) Tj T*"
+        c+=" (and every big number upright, arrow towards the same edge.) Tj T*"
+        c+=" (Back of 1 shows 4?  Run: manual-duplex config REVERSE_BACKS toggle) Tj T*"
+        c+=" (Backs upside down?  Run: manual-duplex config ROTATE_BACKS toggle) Tj T*"
+        c+=" (Backs on the same side as fronts?  Flip the stack the other way.) Tj ET"
+        pages+=("$c")
+    done
+
+    make_tmp tmp
+    write_pdf "$tmp/test.pdf" "$w" "$h" "${pages[@]}"
+    duplex_print "$tmp/test.pdf" "Manual duplex test"
+    cat <<EOF
+Test sent: 2 front sheets are printing; their backs are held.
+Flip the printed stack, load it back into the tray, then run:  $PROG release
+Check: the back of sheet 1 must show "2", the back of sheet 2 must show "4",
+both upright. The printed page explains what to change if not.
+Current: REVERSE_BACKS=$REVERSE_BACKS ROTATE_BACKS=$ROTATE_BACKS
+EOF
+}
+
+# ------------------------------------------------------------------ config --
+config_cmd() {
+    if (($# == 0)); then
+        local k
+        for k in "${CONFIG_KEYS[@]}"; do printf '%s=%q\n' "$k" "${!k}"; done
+        return
+    fi
+    local key=${1^^} val=${2-}
+    [[ " ${CONFIG_KEYS[*]} " == *" $key "* ]] || die "unknown setting '$1' (known: ${CONFIG_KEYS[*]})"
+    if (($# == 1)); then printf '%s\n' "${!key}"; return; fi
+
+    case $key in
+        REVERSE_BACKS | KEEP_PDFS | NOTIFY)
+            if [[ ${val,,} == toggle ]]; then
+                is_yes "${!key}" && val=no || val=yes
+            fi
+            [[ ${val,,} =~ ^(yes|no)$ ]] || die "$key must be yes, no or toggle"
+            val=${val,,} ;;
+        ROTATE_BACKS)
+            if [[ ${val,,} == toggle ]]; then
+                [[ ${!key} == 180 ]] && val=0 || val=180
+            fi
+            [[ $val =~ ^(0|180)$ ]] || die "ROTATE_BACKS must be 0, 180 or toggle" ;;
+        PRINTER)
+            [[ -z $val ]] || LC_ALL=C lpstat -e | grep -qx -- "$val" || die "no printer queue '$val' (queues: $(printer_list))"
+            [[ $val != "$QUEUE" ]] || die "PRINTER must be the real printer, not $QUEUE" ;;
+    esac
+
+    mkdir -p "$CONFIG_DIR"
+    local line tmp
+    printf -v line '%s=%q' "$key" "$val"
+    tmp=$(mktemp "$CONFIG_DIR/.config.XXXXXX")
+    if [[ -f $CONFIG_FILE ]]; then
+        grep -v "^$key=" "$CONFIG_FILE" >"$tmp" || true
+    else
+        printf '# manual-duplex settings — edit with: manual-duplex config KEY VALUE\n' >"$tmp"
+    fi
+    printf '%s\n' "$line" >>"$tmp"
+    mv -f "$tmp" "$CONFIG_FILE"
+    printf '%s\n' "$line"
+}
+
+status_cmd() {
+    local p
+    p=$( (NOTIFY=no; target_printer) 2>/dev/null) || p="(not set — run: $PROG config PRINTER <queue>)"
+    echo "Real printer:   $p"
+    echo "Virtual queue:  $(LC_ALL=C lpstat -e 2>/dev/null | grep -qx "$QUEUE" && echo "$QUEUE" || echo "missing — run: sudo $PROG setup-printer")"
+    echo "Spool watcher:  $(systemctl --user is-active manual-duplex.path 2>/dev/null || true)"
+    echo "Settings:       REVERSE_BACKS=$REVERSE_BACKS ROTATE_BACKS=$ROTATE_BACKS KEEP_PDFS=$KEEP_PDFS NOTIFY=$NOTIFY${LP_OPTIONS:+ LP_OPTIONS=\"$LP_OPTIONS\"}"
+    echo "Spool folder:   $SPOOL_DIR"
+    local failed=("$FAILED_DIR"/*)
+    ((${#failed[@]})) && echo "Failed jobs:    ${#failed[@]} in $FAILED_DIR"
+    if [[ -s $HELD_FILE ]]; then
+        echo "Held backs (release with: $PROG release [JOB-ID]):"
+        sed 's/^/  /' "$HELD_FILE"
+    else
+        echo "Held backs:     none"
+    fi
+}
+
+# ------------------------------------------------------------- root setup --
+setup_printer() {
+    ((EUID == 0)) || die "run as root: sudo $PROG setup-printer"
+    [[ -x /usr/lib/cups/backend/cups-pdf ]] || die "cups-pdf backend missing (pacman -S cups-pdf)"
+    local conf=/etc/cups/cups-pdf-$QUEUE.conf ppd="" cand
+    [[ -f $conf ]] || die "$conf missing (reinstall manual-duplex)"
+    for cand in /usr/share/cups/model/CUPS-PDF_noopt.ppd /usr/share/cups/model/CUPS-PDF_opt.ppd \
+        /usr/share/cups/model/CUPS-PDF*.ppd /usr/share/ppd/cups-pdf/CUPS-PDF*.ppd; do
+        [[ -f $cand ]] && { ppd=$cand; break; }
+    done
+    [[ -n $ppd ]] || die "no CUPS-PDF PPD found"
+
+    lpadmin -p "$QUEUE" -E -v "cups-pdf:/$QUEUE" -P "$ppd" \
+        -D "Manual duplex (prints fronts, holds backs)" -L "virtual printer" \
+        -o printer-is-shared=false
+    echo "Created CUPS queue '$QUEUE' (cups-pdf:/$QUEUE, $ppd)."
+    echo "Next, as your normal user:  $PROG enable && $PROG config PRINTER <queue> && $PROG test"
+}
+
+remove_printer() {
+    ((EUID == 0)) || die "run as root: sudo $PROG remove-printer"
+    lpadmin -x "$QUEUE" && echo "Removed CUPS queue '$QUEUE'."
+}
+
+# -------------------------------------------------------------------- main --
+cmd=${1:-help}
+(($#)) && shift
+case $cmd in
+    print)
+        (($# == 1)) || die "usage: $PROG print FILE.pdf"
+        [[ -f $1 ]] || die "no such file: $1"
+        mkdir -p "$STATE_DIR"
+        t=${1##*/}
+        duplex_print "$1" "${t%.[pP][dD][fF]}" ;;
+    test)    mkdir -p "$STATE_DIR"; test_print ;;
+    release) release_job "${1:-}" ;;
+    process) process_spool "$@" ;;
+    config)  config_cmd "$@" ;;
+    status)  status_cmd ;;
+    enable)
+        mkdir -p "$SPOOL_DIR"
+        systemctl --user enable --now manual-duplex.path
+        echo "Watching $SPOOL_DIR — print to '$QUEUE' from any app." ;;
+    disable) systemctl --user disable --now manual-duplex.path ;;
+    setup-printer)  setup_printer ;;
+    remove-printer) remove_printer ;;
+    _await-release) await_release "$@" ;;
+    -h | --help | help) usage ;;
+    -V | --version) echo "$PROG $VERSION" ;;
+    *) usage >&2; exit 2 ;;
+esac

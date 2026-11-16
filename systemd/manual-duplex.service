@@ -1,0 +1,7 @@
+[Unit]
+Description=Split Manual_Duplex print jobs into fronts and held backs
+Documentation=https://github.com/madyarc/manual-duplex
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/manual-duplex process
