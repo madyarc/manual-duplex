@@ -3,7 +3,7 @@
 # Builds from this checkout: run `makepkg -si` in the repository root.
 
 pkgname=manual-duplex
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Manual two-sided printing for CUPS: a cups-pdf virtual printer that prints fronts and holds the backs"
 arch=('any')

@@ -9,7 +9,7 @@
 set -euo pipefail
 shopt -s nullglob
 
-VERSION=0.1.0
+VERSION=0.2.0
 QUEUE=Manual_Duplex
 PROG=${0##*/}
 
@@ -27,12 +27,13 @@ LOCK_FILE=$STATE_DIR/lock
 # ---------------------------------------------------------------- defaults --
 PRINTER=""          # real printer; empty = CUPS default destination
 REVERSE_BACKS=no    # print backs last-to-first (decide with `manual-duplex test`)
-ROTATE_BACKS=0      # rotate backs by 0 or 180 degrees
+ROTATE_BACKS=0      # 0|180: makes long-edge backs upright (decide with `manual-duplex test`)
+FLIP=long           # long|short edge for `print`, and for jobs whose edge is unknown
 LP_OPTIONS=""       # extra options for both jobs, e.g. "-o media=A4"
 KEEP_PDFS=no        # keep processed PDFs in ~/.cache/manual-duplex/done
 NOTIFY=yes          # desktop notifications (needs notify-send)
 
-CONFIG_KEYS=(PRINTER REVERSE_BACKS ROTATE_BACKS LP_OPTIONS KEEP_PDFS NOTIFY)
+CONFIG_KEYS=(PRINTER REVERSE_BACKS ROTATE_BACKS FLIP LP_OPTIONS KEEP_PDFS NOTIFY)
 
 # shellcheck source=/dev/null
 [[ -r $CONFIG_FILE ]] && . "$CONFIG_FILE"
@@ -67,7 +68,8 @@ usage() {
 $PROG $VERSION — manual two-sided printing for CUPS
 
 Usage:
-  $PROG print FILE.pdf        split FILE.pdf and print it (no virtual printer needed)
+  $PROG print [EDGE] FILE.pdf split FILE.pdf and print it (no virtual printer needed)
+                              EDGE: --long-edge | --short-edge | --one-sided
   $PROG test                  print a 2-sheet test page to calibrate the settings
   $PROG release [JOB-ID]      print the held backs (latest job if no ID given)
   $PROG status                show settings, printers and held jobs
@@ -75,13 +77,18 @@ Usage:
   $PROG enable | disable      start/stop watching the Manual_Duplex spool folder
   $PROG process [FILE...]     process spooled PDFs (run by manual-duplex.service)
 
-  sudo $PROG setup-printer    create the "$QUEUE" CUPS queue
+  sudo $PROG setup-printer [REAL-QUEUE]
+                              create the "$QUEUE" CUPS queue (paper size from REAL-QUEUE)
   sudo $PROG remove-printer   delete it again
+
+The edge (long / short / one-sided) is normally picked per job with the
+print dialog's "Two-Sided" option on the $QUEUE printer.
 
 Settings ($CONFIG_FILE):
   PRINTER        real printer queue (default: CUPS default destination)
   REVERSE_BACKS  yes|no  print backs last-to-first      (now: $REVERSE_BACKS)
-  ROTATE_BACKS   0|180   rotate the back pages           (now: $ROTATE_BACKS)
+  ROTATE_BACKS   0|180   calibration: makes long-edge backs upright (now: $ROTATE_BACKS)
+  FLIP           long|short  edge for 'print'/unknown jobs (now: $FLIP)
   LP_OPTIONS     extra lp options, e.g. "-o media=A4"    (now: ${LP_OPTIONS:-none})
   KEEP_PDFS      yes|no  keep processed PDFs             (now: $KEEP_PDFS)
   NOTIFY         yes|no  desktop notifications           (now: $NOTIFY)
@@ -147,12 +154,21 @@ blank_like() {
 }
 
 # ----------------------------------------------------------- the real work --
-# duplex_print PDF TITLE — print fronts now, queue backs as a held job.
+# duplex_print PDF TITLE [long|short|one] — print fronts now, queue backs
+# as a held job. "short" turns the backs 180° relative to "long" so the
+# sheet reads correctly when flipped over its short edge; the physical way
+# the stack goes back into the printer never changes.
 duplex_print() {
-    local pdf=$1 title=$2 printer pages tmp i
+    local pdf=$1 title=$2 edge=${3:-$FLIP} printer pages tmp i rot
     local -a fronts=() backs=() lpopts=() rotate=()
     need qpdf lp pdfinfo
     printer=$(target_printer)
+
+    case $edge in
+        long | short | one) ;;
+        *) die "FLIP must be long or short (is '$edge')" ;;
+    esac
+    [[ $ROTATE_BACKS =~ ^(0|180)$ ]] || die "ROTATE_BACKS must be 0 or 180 (is '$ROTATE_BACKS')"
 
     pages=$(qpdf --show-npages "$pdf" 2>/dev/null) || die "cannot read '$pdf' as PDF"
     [[ $pages =~ ^[0-9]+$ ]] && ((pages > 0)) || die "'$pdf' has no pages"
@@ -161,6 +177,18 @@ duplex_print() {
     # Layout (n-up etc.) is already baked into the PDF; make the printer leave it alone.
     lpopts=(-o sides=one-sided -o number-up=1 "${lpopts[@]}")
 
+    if [[ $edge == one ]] || ((pages == 1)); then
+        lp -d "$printer" -t "$title" "${lpopts[@]}" "$pdf" >/dev/null ||
+            die "could not send '$title' to $printer"
+        log "'$title': $pages page(s), sent to $printer one-sided"
+        if ((pages == 1)); then
+            notify normal "Printing “$title”" "Single page — no backs needed."
+        else
+            notify normal "Printing “$title”" "One-sided, as chosen in the print dialog."
+        fi
+        return 0
+    fi
+
     make_tmp tmp
 
     for ((i = 1; i <= pages; i += 2)); do fronts+=("$i"); done
@@ -168,14 +196,6 @@ duplex_print() {
 
     qpdf --empty --pages "$pdf" "$(IFS=,; echo "${fronts[*]}")" -- "$tmp/fronts.pdf" ||
         die "qpdf could not extract the fronts of '$title'"
-
-    if ((pages == 1)); then
-        lp -d "$printer" -t "$title" "${lpopts[@]}" "$tmp/fronts.pdf" >/dev/null ||
-            die "could not send '$title' to $printer"
-        log "'$title': 1 page, sent to $printer (nothing to duplex)"
-        notify normal "Printing “$title”" "Single page — no backs needed."
-        return 0
-    fi
 
     # Odd page count: the last sheet gets a blank back so every sheet is fed
     # through again and reversed stacks stay aligned.
@@ -190,11 +210,9 @@ duplex_print() {
         parts=("$pdf" "$(IFS=,; echo "${rev[*]}")")
         ((pages % 2)) && parts=("$tmp/blank.pdf" 1 "${parts[@]}")
     fi
-    case $ROTATE_BACKS in
-        0 | "") ;;
-        180) rotate=(--rotate=+180) ;;
-        *) die "ROTATE_BACKS must be 0 or 180 (is '$ROTATE_BACKS')" ;;
-    esac
+    rot=$ROTATE_BACKS
+    [[ $edge == short ]] && rot=$(((rot + 180) % 360))
+    ((rot)) && rotate=(--rotate=+$rot)
     qpdf --empty "${rotate[@]}" --pages "${parts[@]}" -- "$tmp/backs.pdf" ||
         die "qpdf could not extract the backs of '$title'"
 
@@ -208,15 +226,15 @@ duplex_print() {
     [[ -n $job ]] && printf '%s\t%s\n' "$job" "$title" >>"$HELD_FILE"
 
     local sheets=$(((pages + 1) / 2))
-    log "'$title': $pages pages, fronts sent to $printer, backs held as ${job:-?}"
-    notify_backs "$job" "$title" "$sheets"
+    log "'$title': $pages pages, $edge-edge, fronts sent to $printer, backs held as ${job:-?}"
+    notify_backs "$job" "$title" "$sheets" "$edge"
 }
 
 # Notification with a "Print backs" button. The button needs a process that
 # waits for the click, so it runs as a transient unit that outlives the
 # oneshot service; without systemd-run it degrades to a plain notification.
-notify_backs() { # job title sheets
-    local msg="When the $3 front sheet(s) are done, flip the stack, put it back in the tray, then release job $1 (or run: $PROG release)."
+notify_backs() { # job title sheets edge
+    local msg="Backs are set up for flipping on the $4 edge. When the $3 front sheet(s) are done, put the stack back in the tray the same way as always, then release job $1 (or run: $PROG release)."
     is_yes "$NOTIFY" && command -v notify-send >/dev/null || { log "$msg"; return 0; }
     if [[ -n $1 ]] && command -v systemd-run >/dev/null &&
         systemd-run --user --quiet --collect -- "$(realpath "$0")" _await-release "$1" "$2" "$msg" 2>/dev/null; then
@@ -255,6 +273,30 @@ release_job() {
     notify low "Printing backs" "Job $job released."
 }
 
+# Which edge did the print dialog ask for? job_edge JOB-ID -> long|short|one
+# Dialogs send either the IPP "sides" attribute or the PPD "Duplex" option;
+# when they send neither, the queue's default (as the dialog showed it) applies.
+job_edge() {
+    local t out=""
+    printf -v t '{ OPERATION Get-Job-Attributes GROUP operation-attributes-tag
+        ATTR charset attributes-charset utf-8
+        ATTR naturalLanguage attributes-natural-language en
+        ATTR uri printer-uri $uri ATTR integer job-id %s
+        ATTR name requesting-user-name %s
+        ATTR keyword requested-attributes all DISPLAY sides DISPLAY Duplex }' \
+        "$1" "${USER:-$(id -un)}"
+    command -v ipptool >/dev/null &&
+        out=$(ipptool -t "ipp://localhost/printers/$QUEUE" /dev/stdin <<<"$t" 2>/dev/null) || out=""
+    [[ $out =~ (sides|Duplex)\ \([a-zA-Z]+\)\ =\ ([a-zA-Z-]+) ]] ||
+        out=$(LC_ALL=C lpoptions -p "$QUEUE" -l 2>/dev/null | sed -n 's/^Duplex[^:]*:.*\*\([^ ]*\).*/Duplex (default) = \1/p' || true)
+    case $out in
+        *two-sided-short-edge* | *"= DuplexTumble"*) echo short ;;
+        *two-sided-long-edge* | *"= DuplexNoTumble"*) echo long ;;
+        *"= one-sided"* | *"= None"*) echo one ;;
+        *) echo "$FLIP" ;;
+    esac
+}
+
 # Wait until cups-pdf has finished writing FILE: size stable and parseable.
 wait_complete() {
     # Give up after 120 s in total, or after 10 s without growth that still
@@ -289,10 +331,12 @@ process_spool() {
         mapfile -t files < <(find "$SPOOL_DIR" -maxdepth 1 -type f -iname '*.pdf' -printf '%T@\t%p\n' | sort -n | cut -f2-)
     fi
 
-    local f title
+    local f title edge
     for f in "${files[@]}"; do
         title=${f##*/}
         title=${title%.[pP][dD][fF]}
+        edge=$FLIP
+        [[ $title =~ ^job_([0-9]+)- ]] && edge=$(job_edge "${BASH_REMATCH[1]}")
         title=${title#job_[0-9]*-}
         if ! wait_complete "$f"; then
             log "'$f' never became a complete PDF; moved to $FAILED_DIR"
@@ -302,7 +346,7 @@ process_spool() {
         fi
         # duplex_print exits on fatal errors; run it in a subshell so one bad
         # job never leaves its file behind (that would re-trigger the path unit).
-        if (duplex_print "$f" "$title"); then
+        if (duplex_print "$f" "$title" "$edge"); then
             if is_yes "$KEEP_PDFS"; then
                 mkdir -p "$DONE_DIR" && mv -f -- "$f" "$DONE_DIR/"
             else
@@ -331,22 +375,26 @@ test_print() {
         c+=" BT /F1 320 Tf $((cx - 89)) $((h / 2 - 60)) Td ($p) Tj ET"
         c+=" BT /F1 26 Tf 60 $((h / 2 - 140)) Td (Sheet $sheet - $side - page $p of 4) Tj ET"
         c+=" BT /F1 11 Tf 60 140 Td 15 TL"
-        c+=" (Expected: sheet 1 = pages 1 and 2, sheet 2 = pages 3 and 4,) Tj T*"
-        c+=" (and every big number upright, arrow towards the same edge.) Tj T*"
+        c+=" (Turn sheet 1 over along its LONG edge, like a page in a book:) Tj T*"
+        c+=" (expected 1 on the front, 2 upright on the back; sheet 2 = 3 and 4.) Tj T*"
         c+=" (Back of 1 shows 4?  Run: manual-duplex config REVERSE_BACKS toggle) Tj T*"
-        c+=" (Backs upside down?  Run: manual-duplex config ROTATE_BACKS toggle) Tj T*"
-        c+=" (Backs on the same side as fronts?  Flip the stack the other way.) Tj ET"
+        c+=" (2 is upside down?  Run: manual-duplex config ROTATE_BACKS toggle) Tj T*"
+        c+=" (Backs on the same side as fronts?  Load the stack the other side up.) Tj ET"
         pages+=("$c")
     done
 
     make_tmp tmp
     write_pdf "$tmp/test.pdf" "$w" "$h" "${pages[@]}"
-    duplex_print "$tmp/test.pdf" "Manual duplex test"
+    duplex_print "$tmp/test.pdf" "Manual duplex test" long
     cat <<EOF
 Test sent: 2 front sheets are printing; their backs are held.
-Flip the printed stack, load it back into the tray, then run:  $PROG release
-Check: the back of sheet 1 must show "2", the back of sheet 2 must show "4",
-both upright. The printed page explains what to change if not.
+Put the printed stack back into the tray, blank side to be printed, and
+remember exactly how you did it — always reload it that way. Then run:
+  $PROG release
+Check by turning each sheet over its LONG edge (like a book page): the back
+of sheet 1 must show an upright "2", sheet 2 an upright "4". The printed page
+says what to change if not. The calibration is for long-edge flipping;
+short-edge jobs are turned automatically.
 Current: REVERSE_BACKS=$REVERSE_BACKS ROTATE_BACKS=$ROTATE_BACKS
 EOF
 }
@@ -374,6 +422,9 @@ config_cmd() {
                 [[ ${!key} == 180 ]] && val=0 || val=180
             fi
             [[ $val =~ ^(0|180)$ ]] || die "ROTATE_BACKS must be 0, 180 or toggle" ;;
+        FLIP)
+            val=${val,,}; val=${val%-edge}
+            [[ $val =~ ^(long|short)$ ]] || die "FLIP must be long or short" ;;
         PRINTER)
             [[ -z $val ]] || LC_ALL=C lpstat -e | grep -qx -- "$val" || die "no printer queue '$val' (queues: $(printer_list))"
             [[ $val != "$QUEUE" ]] || die "PRINTER must be the real printer, not $QUEUE" ;;
@@ -399,7 +450,7 @@ status_cmd() {
     echo "Real printer:   $p"
     echo "Virtual queue:  $(LC_ALL=C lpstat -e 2>/dev/null | grep -qx "$QUEUE" && echo "$QUEUE" || echo "missing — run: sudo $PROG setup-printer")"
     echo "Spool watcher:  $(systemctl --user is-active manual-duplex.path 2>/dev/null || true)"
-    echo "Settings:       REVERSE_BACKS=$REVERSE_BACKS ROTATE_BACKS=$ROTATE_BACKS KEEP_PDFS=$KEEP_PDFS NOTIFY=$NOTIFY${LP_OPTIONS:+ LP_OPTIONS=\"$LP_OPTIONS\"}"
+    echo "Settings:       REVERSE_BACKS=$REVERSE_BACKS ROTATE_BACKS=$ROTATE_BACKS FLIP=$FLIP KEEP_PDFS=$KEEP_PDFS NOTIFY=$NOTIFY${LP_OPTIONS:+ LP_OPTIONS=\"$LP_OPTIONS\"}"
     echo "Spool folder:   $SPOOL_DIR"
     local failed=("$FAILED_DIR"/*)
     ((${#failed[@]})) && echo "Failed jobs:    ${#failed[@]} in $FAILED_DIR"
@@ -414,7 +465,7 @@ status_cmd() {
 # ------------------------------------------------------------- root setup --
 setup_printer() {
     ((EUID == 0)) || die "run as root: sudo $PROG setup-printer"
-    [[ -x /usr/lib/cups/backend/cups-pdf ]] || die "cups-pdf backend missing (pacman -S cups-pdf)"
+    [[ -e /usr/lib/cups/backend/cups-pdf ]] || die "cups-pdf backend missing (pacman -S cups-pdf)"
     local conf=/etc/cups/cups-pdf-$QUEUE.conf ppd="" cand
     [[ -f $conf ]] || die "$conf missing (reinstall manual-duplex)"
     for cand in /usr/share/cups/model/CUPS-PDF_noopt.ppd /usr/share/cups/model/CUPS-PDF_opt.ppd \
@@ -423,10 +474,42 @@ setup_printer() {
     done
     [[ -n $ppd ]] || die "no CUPS-PDF PPD found"
 
-    lpadmin -p "$QUEUE" -E -v "cups-pdf:/$QUEUE" -P "$ppd" \
+    # Copy the cups-pdf PPD and add a "Two-Sided" option, so print dialogs
+    # offer Long Edge / Short Edge / Off. cups-pdf ignores it (empty code);
+    # manual-duplex reads the choice back from the job.
+    local tmp real size
+    make_tmp tmp
+    cp "$ppd" "$tmp/$QUEUE.ppd"
+    grep -q '^\*OpenUI \*Duplex' "$tmp/$QUEUE.ppd" || cat >>"$tmp/$QUEUE.ppd" <<'PPD'
+
+*% Added by manual-duplex: the edge the finished sheets are turned over on.
+*OpenUI *Duplex/Two-Sided: PickOne
+*OrderDependency: 50 AnySetup *Duplex
+*DefaultDuplex: DuplexNoTumble
+*Duplex None/Off (one-sided): ""
+*Duplex DuplexNoTumble/Long Edge (standard): ""
+*Duplex DuplexTumble/Short Edge (flip): ""
+*CloseUI: *Duplex
+PPD
+
+    # Default paper size = the real printer's, so jobs are laid out for the
+    # paper that is actually loaded.
+    real=${1:-$(LC_ALL=C lpstat -d 2>/dev/null | sed -n 's/^system default destination: //p')}
+    if [[ -n $real && $real != "$QUEUE" ]]; then
+        size=$(LC_ALL=C lpoptions -p "$real" -l 2>/dev/null | sed -n 's/^PageSize[^:]*:.*\*\([^ ]*\).*/\1/p')
+        if [[ -n $size ]] && grep -q "^\*PageSize $size[/:]" "$tmp/$QUEUE.ppd"; then
+            sed -i -E "s/^\*Default(PageSize|PageRegion|ImageableArea|PaperDimension): .*/*Default\1: $size/" "$tmp/$QUEUE.ppd"
+            echo "Default paper size: $size (from $real)"
+        fi
+    else
+        echo "Tip: sudo $PROG setup-printer <real queue> copies its paper size."
+    fi
+
+    lpadmin -p "$QUEUE" -E -v "cups-pdf:/$QUEUE" -P "$tmp/$QUEUE.ppd" \
         -D "Manual duplex (prints fronts, holds backs)" -L "virtual printer" \
         -o printer-is-shared=false
     echo "Created CUPS queue '$QUEUE' (cups-pdf:/$QUEUE, $ppd)."
+    echo "Pick the edge per job in the print dialog (Two-Sided: Long / Short Edge)."
     echo "Next, as your normal user:  $PROG enable && $PROG config PRINTER <queue> && $PROG test"
 }
 
@@ -440,11 +523,17 @@ cmd=${1:-help}
 (($#)) && shift
 case $cmd in
     print)
-        (($# == 1)) || die "usage: $PROG print FILE.pdf"
+        e=$FLIP
+        case ${1:-} in
+            -l | --long-edge) e=long; shift ;;
+            -s | --short-edge) e=short; shift ;;
+            -1 | --one-sided) e=one; shift ;;
+        esac
+        (($# == 1)) || die "usage: $PROG print [--long-edge|--short-edge|--one-sided] FILE.pdf"
         [[ -f $1 ]] || die "no such file: $1"
         mkdir -p "$STATE_DIR"
         t=${1##*/}
-        duplex_print "$1" "${t%.[pP][dD][fF]}" ;;
+        duplex_print "$1" "${t%.[pP][dD][fF]}" "$e" ;;
     test)    mkdir -p "$STATE_DIR"; test_print ;;
     release) release_job "${1:-}" ;;
     process) process_spool "$@" ;;
@@ -455,7 +544,7 @@ case $cmd in
         systemctl --user enable --now manual-duplex.path
         echo "Watching $SPOOL_DIR — print to '$QUEUE' from any app." ;;
     disable) systemctl --user disable --now manual-duplex.path ;;
-    setup-printer)  setup_printer ;;
+    setup-printer)  setup_printer "${1:-}" ;;
     remove-printer) remove_printer ;;
     _await-release) await_release "$@" ;;
     -h | --help | help) usage ;;

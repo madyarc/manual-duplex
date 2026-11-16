@@ -8,8 +8,13 @@ PRINTER=""
 # if the back of sheet 1 shows page 4, toggle this.
 REVERSE_BACKS=no
 
-# Rotate the backs by 180 degrees if they come out upside down.
+# Calibration: 180 if, with long-edge flipping, the backs come out upside down.
 ROTATE_BACKS=0
+
+# Edge used by `manual-duplex print` and for jobs whose Two-Sided choice is
+# unknown: long (like a book) or short (like a notepad). Print dialogs set
+# this per job.
+FLIP=long
 
 # Extra options for both jobs, e.g. "-o media=A4 -o InputSlot=Manual".
 LP_OPTIONS=""
